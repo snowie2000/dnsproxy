@@ -5,8 +5,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/miekg/dns"
-	"github.com/pmylund/go-cache"
 	"log"
 	"net"
 	"os"
@@ -17,6 +15,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/miekg/dns"
+	"github.com/pmylund/go-cache"
+	"golang.org/x/net/proxy"
 )
 
 var (
@@ -26,8 +28,9 @@ var (
 	encache = flag.Bool("cache", true, "enable go-cache")
 	expire  = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use doamin ttl time")
 	file    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "cache.dat"), "cached file")
-	ipv6    = flag.Bool("6", false, "skip ipv6 record query AAAA")
+	ipv6    = flag.Bool("6", true, "skip ipv6 record query AAAA")
 	timeout = flag.Int("timeout", 200, "read/write timeout")
+	s5proxy = flag.String("proxy", "", "socks5 proxy")
 
 	clientTCP *dns.Client
 	clientUDP *dns.Client
@@ -50,11 +53,13 @@ func toMd5(data string) string {
 
 func intervalSaveCache() {
 	save := func() {
-		err := conn.SaveFile(*file)
-		if err == nil {
-			log.Printf("cache saved: %s\n", *file)
-		} else {
-			log.Printf("cache save failed: %s, %s\n", *file, err)
+		if ENCACHE {
+			err := conn.SaveFile(*file)
+			if err == nil {
+				log.Printf("cache saved: %s\n", *file)
+			} else {
+				log.Printf("cache save failed: %s, %s\n", *file, err)
+			}
 		}
 	}
 	go func() {
@@ -81,8 +86,18 @@ func init() {
 
 	ENCACHE = *encache
 	DEBUG = *debug
+	var proxyDialer proxy.Dialer = nil
 
 	runtime.GOMAXPROCS(runtime.NumCPU()*2 - 1)
+	if *s5proxy != "" {
+		proxyDialer, _ = proxy.SOCKS5("tcp", *s5proxy,
+			nil,
+			&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 10 * time.Second,
+			},
+		)
+	}
 
 	clientTCP = new(dns.Client)
 	clientTCP.Net = "tcp"
@@ -93,6 +108,10 @@ func init() {
 	clientUDP.Net = "udp"
 	clientUDP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
 	clientUDP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
+	if proxyDialer != nil {
+		clientTCP.DirectDial = proxyDialer.Dial
+		clientUDP.DirectDial = proxyDialer.Dial
+	}
 
 	if ENCACHE {
 		conn = cache.New(time.Second*time.Duration(*expire), time.Second*60)
@@ -125,7 +144,9 @@ func init() {
 		log.Fatalln("dns address must be not empty")
 	}
 
-	signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+	if ENCACHE {
+		signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+	}
 }
 
 func main() {
@@ -158,6 +179,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		questions []dns.Question
 		used      string
 	)
+	defer w.Close()
 
 	defer func() {
 		if err := recover(); err != nil {
@@ -246,8 +268,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		data, err = m.Pack()
 		if err == nil {
-			_, err = w.Write(data)
-
+			err = w.WriteMsg(m)
 			if err == nil {
 				if ENCACHE {
 					m.Id = 0
